@@ -1,4 +1,5 @@
 (ns lt.objs.sidebar.workspace
+  "Provide sidebar for managing workspaces and files within a workspace"
   (:require [lt.object :as object]
             [lt.objs.command :as cmd]
             [lt.objs.context :as ctx]
@@ -7,28 +8,14 @@
             [lt.objs.opener :as opener]
             [lt.objs.popup :as popup]
             [lt.objs.sidebar :as sidebar]
+            [lt.objs.dialogs :as dialogs]
+            [lt.objs.document :as document]
+            [lt.objs.menu :as menu]
             [lt.util.dom :as dom]
             [lt.util.cljs :refer [->dottedkw]]
             [crate.binding :refer [bound subatom]]
             [clojure.string :as string])
   (:require-macros [lt.macros :refer [behavior defui]]))
-
-(def active-dialog nil)
-(def gui (js/require "nw.gui"))
-
-(defn menu-item [opts]
-  (let [mi (.-MenuItem gui)]
-    (mi. (clj->js opts))))
-
-(defn menu [items]
-  (let [m (.-Menu gui)
-        menu (m.)]
-    (doseq [i items]
-      (.append menu (menu-item i)))
-    menu))
-
-(defn show-menu [m x y]
-  (.popup m x y))
 
 (defn files-and-folders [path]
   (let [fs (workspace/files-and-folders path)]
@@ -47,6 +34,11 @@
   (if (object/has-tag? child :workspace.file)
     (object/update! p [:files] (fn [cur] (vec (remove #{child} cur))))
     (object/update! p [:folders] (fn [cur] (vec (remove #{child} cur))))))
+
+(defn find-by-path [path]
+  (first (filter #(= (:path @%) path) (object/by-tag :tree-item))))
+
+(declare tree)
 
 (behavior ::add-ws-folder
           :triggers #{:workspace.add.folder!}
@@ -67,7 +59,11 @@
                       (object/merge! this {:open? true})
                       (when-not (:realized? @this)
                         (object/merge! this {:realized? true})
-                        (object/merge! this (files-and-folders (:path @this))))))
+                        (object/merge! this (files-and-folders (:path @this)))
+                        (let [folder (dom/$ :ul (object/->content this))
+                              width (dom/scroll-width folder)]
+                          (doseq [child (dom/children folder)]
+                            (dom/css child {:width width}))))))
 
 (behavior ::refresh
           :triggers #{:refresh!}
@@ -140,9 +136,6 @@
           :reaction (fn [this cur]
                       (concat cur (:open-dirs @tree))))
 
-(defn find-by-path [path]
-  (first (filter #(= (:path @%) path) (object/by-tag :tree-item))))
-
 (behavior ::watched.delete
           :triggers #{:watched.delete}
           :reaction (fn [ws path]
@@ -166,26 +159,23 @@
 (behavior ::on-drop
           :triggers #{:drop}
           :reaction (fn [this e]
-                      (try
-                        (let [size (.-dataTransfer.files.length e)]
-                          (loop [i 0]
-                            (when (< i size)
-                              (let [path (-> (.-dataTransfer.files e)
-                                             (aget i)
-                                             (.-path))]
-                                (if (files/dir? path)
-                                  (object/raise workspace/current-ws :add.folder! path)
-                                  (object/raise workspace/current-ws :add.file! path)))
-                              (recur (inc i)))))
-                        (catch js/Error e
-                          (println e)))))
+                      (let [size (.-dataTransfer.files.length e)]
+                        (loop [i 0]
+                          (when (< i size)
+                            (let [path (-> (.-dataTransfer.files e)
+                                           (aget i)
+                                           (.-path))]
+                              (if (files/dir? path)
+                                (object/raise workspace/current-ws :add.folder! path)
+                                (object/raise workspace/current-ws :add.file! path)))
+                            (recur (inc i)))))))
 
 (behavior ::on-menu
           :triggers #{:menu!}
           :reaction (fn [this e]
                       (let [items (sort-by :order (object/raise-reduce this :menu-items []))]
-                        (-> (menu items)
-                            (show-menu (.-clientX e) (.-clientY e))))))
+                        (-> (menu/menu items)
+                            (menu/show-menu)))))
 
 (behavior ::on-root-menu
           :triggers #{:menu-items}
@@ -201,11 +191,15 @@
 (behavior ::subfile-menu
           :triggers #{:menu-items}
           :reaction (fn [this items]
-                      (conj items {:label "Rename"
-                                   :order 1
-                                   :click (fn [] (object/raise this :start-rename!))}
-                            {:label "Delete"
+                      (conj items
+                            {:label "Duplicate"
+                             :order 1
+                             :click (fn [] (object/raise this :duplicate!))}
+                            {:label "Rename"
                              :order 2
+                             :click (fn [] (object/raise this :start-rename!))}
+                            {:label "Delete"
+                             :order 3
                              :click (fn [] (object/raise this :delete!))})))
 
 (behavior ::subfolder-menu
@@ -297,7 +291,8 @@
                       (let [path (:path @this)
                             neue (files/join (files/parent path) n)]
                         (when-not (= path neue)
-                          (if (files/exists? neue)
+                          ;; In OSX rename is case-sensistive but exists check isn't
+                          (if (and (not= (string/lower-case path) (string/lower-case neue)) (files/exists? neue))
                             (popup/popup! {:header "Folder already exists."
                                            :body (str "The folder " neue " already exists, you'll have to pick a different name.")
                                            :buttons [{:label "ok"
@@ -308,6 +303,12 @@
                               (object/merge! this {:path neue :realized? false})
                               (files/move! path neue)
                               (object/raise this :refresh!)
+                              (let [docs (get-in @document/manager [:files])
+                                    old-path (string/join [path files/separator])
+                                    affected (filter (fn [x] (.startsWith x old-path)) (keys docs))]
+                                (doseq [old-fpath affected]
+                                  (let [new-fpath (string/replace-first old-fpath path neue)]
+                                    (document/move-doc old-fpath new-fpath))))
                               (if root?
                                 (object/raise workspace/current-ws :rename! path neue)
                                 (object/raise workspace/current-ws :watched.rename path neue))
@@ -319,7 +320,8 @@
                       (let [path (:path @this)
                             neue (files/join (files/parent path) n)]
                         (when-not (= path neue)
-                          (if (files/exists? neue)
+                          ;; In OSX rename is case-sensistive but exists check isn't
+                          (if (and (not= (string/lower-case path) (string/lower-case neue)) (files/exists? neue))
                             (popup/popup! {:header "File already exists."
                                            :body (str "The file" neue " already exists, you'll have to pick a different name.")
                                            :buttons [{:label "ok"
@@ -339,7 +341,9 @@
           :reaction (fn [this]
                       (object/merge! this {:renaming? true})
                       (let [input (dom/$ :input (object/->content this))
-                            len (count (files/without-ext (files/basename (:path @this))))]
+                            len (count (files/without-ext (files/basename (:path @this))))
+                            width (dom/scroll-width (dom/parent input))]
+                        (dom/css input {:width width})
                         (dom/focus input)
                         (dom/selection input 0 len "forward"))))
 
@@ -368,6 +372,14 @@
           :reaction (fn [this]
                       (object/merge! this {:renaming? false})
                       ))
+
+(behavior ::duplicate
+          :triggers #{:duplicate!}
+          :reaction (fn [this]
+                      (let [base-name (files/without-ext (files/basename (:path @this)))
+                            new-name (str base-name " copy." (files/ext (:path @this)))
+                            new-path (files/join (files/parent (:path @this)) new-name)]
+                        (files/copy (:path @this) new-path))))
 
 (behavior ::destroy-sub-tree
           :trigger #{:destroy}
@@ -469,12 +481,10 @@
                        (object/raise tree event (dom/val me))))))
 
 (defn open-folder []
-  (set! active-dialog (input :nwdirectory :workspace.add.folder!))
-  (dom/trigger active-dialog :click))
+  (dialogs/dir tree :workspace.add.folder!))
 
 (defn open-file []
-  (set! active-dialog (input :blah :workspace.add.file!))
-  (dom/trigger active-dialog :click))
+  (dialogs/file tree :workspace.add.file!))
 
 (defui button [name action]
   [:li name]
@@ -498,6 +508,11 @@
   :click (fn []
            (object/raise this :select!)))
 
+(defui back-button [this]
+  [:h2 "Select a workspace"]
+  :click (fn []
+           (object/raise this :tree!)))
+
 (defui recents [this rs]
   [:div
    (back-button this)
@@ -505,10 +520,7 @@
     (for [r rs]
       (object/->content r))]])
 
-(defui back-button [this]
-  [:h2 "Select a workspace"]
-  :click (fn []
-           (object/raise this :tree!)))
+(declare sidebar-workspace)
 
 (behavior ::recent!
           :triggers #{:recent!}

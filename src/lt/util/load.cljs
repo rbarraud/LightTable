@@ -1,24 +1,44 @@
 (ns lt.util.load
+  "Provide functions to load js, css and node module assets into LT."
   (:require [clojure.string :as string]))
 
-(def fpath (js/require "path"))
-(def fs (js/require "fs"))
+(def fpath "Provides access to Node/Electron [path library](https://nodejs.org/api/path.html)." (js/require "path"))
+(def fs "Provides access to Node/Electron [fs library](https://nodejs.org/api/fs.html)." (js/require "fs"))
 
-(def pwd (.resolve fpath "."))
+(def dir "Directory where Light Table is being executed." (str js/__dirname "/.."))
 
-(def ^:dynamic *force-reload* false)
+(def ^:dynamic *force-reload* "When true, various parts of Light Table will reload."
+  false)
 
-(def fpath (js/require "path"))
+(def separator
+  "Current platform-specific file separator."
+  (.-sep fpath))
 
-(def separator (.-sep fpath))
+(defn absolute?
+  "True if `path` is formatted as an absolute filepath. False otherwise.
+  Does not check if `path` exists or is otherwise valid.
 
-(defn absolute? [path]
+  Example:
+  ```
+  (absolute? \"/foo/bar/baz\")     ;;=> true
+
+  (absolute? \"/foo/bar/baz.txt\") ;;=> true
+
+  (absolute? \"./foo/bar\")        ;;=> false
+
+  (absolute? \"foo/bar\")          ;;=> false
+  ```"
+  [path]
   (boolean (re-seq #"^\s*[\\\/]|([\w]+:[\\\/])" path)))
 
-(defn node-module [path]
-  (js/require (str pwd "/core/node_modules/" path)))
+(defn node-module
+  "Requires Light Table's bundled node modules located at `path`."
+  [path]
+  (js/require (str dir "/core/node_modules/" path)))
 
-(defn- abs-source-mapping-url [code file]
+(defn- abs-source-mapping-url
+  "Converts source mapping to use absolute paths for URLs. Also converts `\\` to `/` in order to maintain compatibility with Windows."
+  [code file]
   (if-let [path-to-source-map (second (re-find #"\n//# sourceMappingURL=(.*\.map)" code))]
     (if-not (absolute? path-to-source-map)
       (let [abs-path-to-source-map (string/replace (.join fpath (.dirname fpath file) path-to-source-map) "\\" "/")
@@ -35,31 +55,38 @@
       (str "\n\n//# sourceURL="  (js/encodeURI file))))
 
 (defn js
+  "Loads `file`, into Light Table and evaluates it.
+
+  If `sync` is not provided then it defaults to `false`. If `sync` is truthy then `file` will be loaded synchronously."
   ([file] (js file false))
   ([file sync]
    (let [file (if-not (absolute? file)
-                (.join fpath pwd file)
+                (.join fpath dir file)
                 file)]
    (if sync
      (js/window.eval (-> (.readFileSync fs file)
                          (.toString)
                          (prep file)))
-     (.readFile fs (.join fpath pwd file) (fn [content]
+     (.readFile fs (.join fpath dir file) (fn [content]
                                             (js/window.eval (-> (.toString content)
                                                                 (prep file)))))))))
 
-(defn css [file]
-   (let [link (js/document.createElement "link")]
-     (set! (.-type link) "text/css")
-     (set! (.-rel link) "stylesheet")
-     (set! (.-href link) (if (absolute? file)
-                           (str "file://" file)
-                           file))
-     (js/document.head.appendChild link)
-     link))
+(defn css
+  "Loads `file` into Light Table as CSS. Returns the resulting link."
+  [file]
+  (let [link (js/document.createElement "link")]
+    (set! (.-type link) "text/css")
+    (set! (.-rel link) "stylesheet")
+    (set! (.-href link) (if (absolute? file)
+                          (str "file://" file)
+                          file))
+    (js/document.head.appendChild link)
+    link))
 
 
-(defn obj-exists? [s]
+(defn obj-exists?
+  "When string `s` corresponds to a Javascript object already existing in Light Table then return the found object."
+  [s]
   (loop [parts (string/split s ".")
          cur js/window]
     (if-not (first parts)
@@ -67,15 +94,23 @@
       (if-let [cur (aget cur (first parts))]
         (recur (rest parts) cur)))))
 
-(def provided #js {})
+(def provided
+  "An empty Javascript object."
+  #js {})
 
-(defn provided-ancestors [parent]
+(defn provided-ancestors
+  "Return the number of ancestors of `parent`."
+  [parent]
   (count (.filter (js/Object.keys provided) #(> (.indexOf % parent) -1))))
 
-(defn only-ancestors? [cur s]
+(defn only-ancestors?
+  "True if the number of keys is less than or equal to the number of ancestors found."
+  [cur s]
   (<= (.-length (js/Object.keys cur)) (provided-ancestors s)))
 
-(defn provided? [s]
+(defn provided?
+  "No usage was found in Light Table core and is a candidate for deprecation. Do not use."
+  [s]
   (if *force-reload*
     false
     (let [res (if (aget provided s)
